@@ -13,6 +13,7 @@ Board coordinates: ``(0, 0)`` is the bottom-left corner.
 Game-state schema reference: https://docs.battlesnake.com/api
 """
 
+import time
 from collections import deque
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -44,7 +45,13 @@ def get_info() -> Dict[str, str]:
 
 
 def choose_move(game_state: Dict) -> str:
-    """Return the next move using the model, with a heuristic fallback."""
+    """Return the next move: time-boxed search, then model, then heuristic."""
+    try:
+        move = choose_move_search(game_state)
+    except Exception:  # noqa: BLE001 - search must never break gameplay
+        move = None
+    if move is not None:
+        return move
     try:
         move = choose_move_model(game_state)
     except Exception:  # noqa: BLE001 - a model issue must never break gameplay
@@ -165,6 +172,296 @@ def _in_bounds(p: Point, width: int, height: int) -> bool:
 
 def _manhattan(a: Point, b: Point) -> int:
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+
+# --- Paranoid minimax search with alpha-beta + iterative deepening ----------
+#
+# Board state is copy-on-write: bodies are tuples (head first), so building a
+# child state after a turn is just constructing new tuples, no deep copies.
+# Opponents outside ``_ACTIVE_RADIUS`` of our head are not branched over (that
+# would blow up the branching factor with 3+ snakes); they're assigned a
+# single greedy survival move instead. Nearby opponents are treated as fully
+# adversarial (paranoid) so alpha-beta pruning stays valid.
+
+_ACTIVE_RADIUS = 5
+_MAX_SEARCH_DEPTH = 12
+_TIME_SAFETY_MARGIN_MS = 120
+
+
+class _SearchTimeout(Exception):
+    pass
+
+
+def _build_sim(game_state: Dict) -> Dict:
+    board = game_state["board"]
+    food = frozenset((f["x"], f["y"]) for f in board["food"])
+    snakes = {
+        s["id"]: {"body": tuple((seg["x"], seg["y"]) for seg in s["body"]), "health": s["health"]}
+        for s in board["snakes"]
+    }
+    return {
+        "width": board["width"],
+        "height": board["height"],
+        "food": food,
+        "snakes": snakes,
+        "my_id": game_state["you"]["id"],
+    }
+
+
+def _legal_moves_sim(body: Tuple[Point, ...], width: int, height: int) -> List[str]:
+    """Directions that stay on the board and don't reverse into our own neck."""
+    head = body[0]
+    neck = body[1] if len(body) > 1 else None
+    moves = [
+        move
+        for move, (dx, dy) in DIRECTIONS.items()
+        if _in_bounds((head[0] + dx, head[1] + dy), width, height)
+        and (head[0] + dx, head[1] + dy) != neck
+    ]
+    if moves:
+        return moves
+    # Fully boxed in (or neck check left nothing) -> any in-bounds move, else all.
+    moves = [
+        move
+        for move, (dx, dy) in DIRECTIONS.items()
+        if _in_bounds((head[0] + dx, head[1] + dy), width, height)
+    ]
+    return moves or list(DIRECTIONS.keys())
+
+
+def _order_moves(sim: Dict, sid: str, legal_moves: List[str]) -> List[str]:
+    """Cheap best-first ordering (more resulting open space first) to help pruning."""
+    if len(legal_moves) <= 1:
+        return legal_moves
+    occupied: Set[Point] = set()
+    for s in sim["snakes"].values():
+        occupied.update(s["body"])
+    head = sim["snakes"][sid]["body"][0]
+    scored = []
+    for move in legal_moves:
+        dx, dy = DIRECTIONS[move]
+        nxt = (head[0] + dx, head[1] + dy)
+        space = _flood_fill(nxt, occupied, sim["width"], sim["height"], limit=8)
+        scored.append((space, move))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return [move for _, move in scored]
+
+
+def _active_opponents(sim: Dict, my_id: str) -> List[str]:
+    my_head = sim["snakes"][my_id]["body"][0]
+    return [
+        sid
+        for sid, s in sim["snakes"].items()
+        if sid != my_id and _manhattan(my_head, s["body"][0]) <= _ACTIVE_RADIUS
+    ]
+
+
+def _apply_moves(sim: Dict, moves: Dict[str, str]) -> Dict:
+    """Resolve one simultaneous turn for every snake that has a chosen move."""
+    width, height = sim["width"], sim["height"]
+    snakes = sim["snakes"]
+
+    new_heads: Dict[str, Point] = {}
+    new_bodies: Dict[str, Tuple[Point, ...]] = {}
+    ate: Dict[str, bool] = {}
+    for sid, move in moves.items():
+        body = snakes[sid]["body"]
+        dx, dy = DIRECTIONS[move]
+        new_head = (body[0][0] + dx, body[0][1] + dy)
+        new_heads[sid] = new_head
+        will_eat = new_head in sim["food"]
+        ate[sid] = will_eat
+        new_bodies[sid] = (new_head,) + (body if will_eat else body[:-1])
+
+    ids = list(new_bodies.keys())
+    blocking: Set[Point] = set()
+    for sid in ids:
+        blocking.update(new_bodies[sid][1:])
+
+    dead: Set[str] = set()
+    for sid in ids:
+        head = new_heads[sid]
+        if not _in_bounds(head, width, height) or head in blocking:
+            dead.add(sid)
+    for sid in ids:
+        if sid in dead:
+            continue
+        new_health = 100 if ate[sid] else snakes[sid]["health"] - 1
+        if new_health <= 0:
+            dead.add(sid)
+
+    head_groups: Dict[Point, List[str]] = {}
+    for sid in ids:
+        head_groups.setdefault(new_heads[sid], []).append(sid)
+    for head, group in head_groups.items():
+        if len(group) < 2:
+            continue
+        lengths = {sid: len(new_bodies[sid]) for sid in group}
+        max_len = max(lengths.values())
+        survivors = [sid for sid in group if lengths[sid] == max_len]
+        losers = group if len(survivors) != 1 else [sid for sid in group if sid != survivors[0]]
+        dead.update(losers)
+
+    new_food = set(sim["food"])
+    for sid in ids:
+        if ate[sid]:
+            new_food.discard(new_heads[sid])
+
+    new_snakes = {}
+    for sid in ids:
+        if sid in dead:
+            continue
+        new_health = 100 if ate[sid] else snakes[sid]["health"] - 1
+        new_snakes[sid] = {"body": new_bodies[sid], "health": new_health}
+
+    return {
+        "width": width,
+        "height": height,
+        "food": frozenset(new_food),
+        "snakes": new_snakes,
+        "my_id": sim["my_id"],
+    }
+
+
+def _evaluate(sim: Dict, my_id: str) -> float:
+    snakes = sim["snakes"]
+    if my_id not in snakes:
+        return -1_000_000.0
+
+    width, height = sim["width"], sim["height"]
+    me = snakes[my_id]
+    my_head = me["body"][0]
+    others = [sid for sid in snakes if sid != my_id]
+
+    if not others:
+        # Solo mode, or every opponent has been eliminated: still need to
+        # avoid trapping ourselves, so score by self-reachable space.
+        space = _flood_fill(my_head, set(me["body"]), width, height, limit=width * height)
+        score = 1_000_000.0 + space + me["health"] * 0.1
+        if sim["food"] and me["health"] < HUNGRY_THRESHOLD:
+            nearest_food = min(_manhattan(my_head, f) for f in sim["food"])
+            score -= nearest_food * 3.0
+        return score
+
+    occupied: Set[Point] = set()
+    for s in snakes.values():
+        occupied.update(s["body"])
+
+    enemy_heads = [snakes[sid]["body"][0] for sid in others]
+    my_dist = _bfs_dist([my_head], occupied, width, height)
+    enemy_dist = _bfs_dist(enemy_heads, occupied, width, height)
+    voronoi = sum(1 for cell, d in my_dist.items() if d < enemy_dist.get(cell, _BIG))
+
+    length_adv = len(me["body"]) - max(len(snakes[sid]["body"]) for sid in others)
+
+    score = voronoi * 4.0 + length_adv * 20.0 + me["health"] * 0.5
+    if sim["food"]:
+        nearest_food = min(_manhattan(my_head, f) for f in sim["food"])
+        score -= nearest_food * (3.0 if me["health"] < HUNGRY_THRESHOLD else 0.1)
+    return score
+
+
+def _search(
+    sim: Dict,
+    depth: int,
+    alpha: float,
+    beta: float,
+    my_id: str,
+    deadline: float,
+    want_move: bool = False,
+):
+    if time.monotonic() > deadline:
+        raise _SearchTimeout()
+    if my_id not in sim["snakes"]:
+        return (None, -1_000_000.0) if want_move else -1_000_000.0
+    if depth == 0:
+        value = _evaluate(sim, my_id)
+        return (None, value) if want_move else value
+
+    # Opponents remaining on the board (empty in solo mode or once we've won
+    # by elimination) - search still continues so we keep avoiding self-traps.
+    others = [sid for sid in sim["snakes"] if sid != my_id]
+    active = _active_opponents(sim, my_id)
+    order = [my_id] + active
+
+    def rec(i: int, moves_acc: Dict[str, str], alpha: float, beta: float) -> float:
+        if time.monotonic() > deadline:
+            raise _SearchTimeout()
+        if i == len(order):
+            full_moves = dict(moves_acc)
+            for sid in others:
+                if sid in full_moves:
+                    continue
+                passive_legal = _legal_moves_sim(sim["snakes"][sid]["body"], sim["width"], sim["height"])
+                full_moves[sid] = _order_moves(sim, sid, passive_legal)[0]
+            new_sim = _apply_moves(sim, full_moves)
+            return _search(new_sim, depth - 1, alpha, beta, my_id, deadline)
+
+        sid = order[i]
+        legal = _order_moves(sim, sid, _legal_moves_sim(sim["snakes"][sid]["body"], sim["width"], sim["height"]))
+        if sid == my_id:
+            value = float("-inf")
+            for move in legal:
+                moves_acc[sid] = move
+                value = max(value, rec(i + 1, moves_acc, alpha, beta))
+                alpha = max(alpha, value)
+                if alpha >= beta:
+                    break
+            return value
+        else:
+            value = float("inf")
+            for move in legal:
+                moves_acc[sid] = move
+                value = min(value, rec(i + 1, moves_acc, alpha, beta))
+                beta = min(beta, value)
+                if alpha >= beta:
+                    break
+            return value
+
+    if not want_move:
+        return rec(0, {}, alpha, beta)
+
+    legal = _order_moves(sim, my_id, _legal_moves_sim(sim["snakes"][my_id]["body"], sim["width"], sim["height"]))
+    best_move, best_value = legal[0], float("-inf")
+    for move in legal:
+        value = rec(1, {my_id: move}, alpha, beta)
+        if value > best_value:
+            best_value, best_move = value, move
+        alpha = max(alpha, best_value)
+    return best_move, best_value
+
+
+def choose_move_search(game_state: Dict) -> Optional[str]:
+    """Iterative-deepening paranoid minimax, time-boxed to the move timeout."""
+    start = time.monotonic()
+    timeout_ms = game_state.get("game", {}).get("timeout", 500)
+    budget = max(0.05, (timeout_ms - _TIME_SAFETY_MARGIN_MS) / 1000.0)
+    deadline = start + budget
+
+    sim = _build_sim(game_state)
+    my_id = sim["my_id"]
+    if my_id not in sim["snakes"]:
+        return None
+
+    legal = _legal_moves_sim(sim["snakes"][my_id]["body"], sim["width"], sim["height"])
+    if not legal:
+        return None
+    if len(legal) == 1:
+        return legal[0]
+
+    best_move: Optional[str] = None
+    depth = 1
+    try:
+        while depth <= _MAX_SEARCH_DEPTH:
+            if time.monotonic() > deadline:
+                break
+            move, _value = _search(sim, depth, float("-inf"), float("inf"), my_id, deadline, want_move=True)
+            best_move = move
+            depth += 1
+    except _SearchTimeout:
+        pass
+
+    return best_move
 
 
 # --- Embedded model features -------------------------------------------------
