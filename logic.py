@@ -37,10 +37,10 @@ def get_info() -> Dict[str, str]:
     return {
         "apiversion": "1",
         "author": "hackathon",
-        "color": "#6434eb",
-        "head": "smart-caterpillar",
-        "tail": "weight",
-        "version": "0.1.0",
+        "color": "#cc0000",
+        "head": "evil",
+        "tail": "hook",
+        "version": "0.2.0-hunter",
     }
 
 
@@ -185,14 +185,53 @@ def _manhattan(a: Point, b: Point) -> int:
 
 _ACTIVE_RADIUS = 5
 _MAX_SEARCH_DEPTH = 12
-# The engine's move timeout (default 500ms) bounds the *entire* HTTP round trip
-# (network + framework + compute), not just our search. On a slow/free host,
-# spending most of the window on compute makes the reply land after the timeout,
-# and the engine then moves us with a default direction that can walk into a
-# wall on turn 0. So we reserve a large slice for everything-but-compute and cap
-# the search budget hard.
-_MOVE_RESERVE_MS = 350
-_MAX_COMPUTE_MS = 150
+
+# The engine's move timeout bounds the *entire* HTTP round trip (network +
+# framework + compute), not just our search — on a remote host with ~200ms
+# ping, spending most of the window on compute means the reply lands after the
+# deadline and the engine substitutes a default move. Turn 0 therefore starts
+# from a conservative fixed budget; from turn 1 onward the budget adapts:
+# ``you.latency`` is the engine-measured round trip of our previous move, so
+# ``latency - our previous compute time`` is the real overhead of this
+# deployment, and we can safely spend everything above it.
+_FALLBACK_RESERVE_MS = 350.0  # turn-0 reserve before overhead is known
+_FALLBACK_MAX_COMPUTE_MS = 150.0
+_LATENCY_HEADROOM = 1.25  # multiplier on observed overhead to absorb jitter
+_LATENCY_SAFETY_MS = 80.0  # additive margin on top of observed overhead
+_ADAPTIVE_MAX_COMPUTE_MS = 300.0
+_MIN_COMPUTE_MS = 20.0
+# Wall-clock compute spent on our previous turn, keyed by (game id, snake id).
+_prev_compute_ms: Dict[Tuple[str, str], float] = {}
+
+
+def _compute_budget_ms(game_state: Dict) -> float:
+    """Search budget for this move, adapted to the observed network overhead."""
+    timeout_ms = float(game_state.get("game", {}).get("timeout", 500))
+    you = game_state["you"]
+    key = (game_state.get("game", {}).get("id", ""), you["id"])
+
+    budget_ms = min(timeout_ms - _FALLBACK_RESERVE_MS, _FALLBACK_MAX_COMPUTE_MS)
+    prev_ms = _prev_compute_ms.get(key)
+    if prev_ms is not None:
+        try:
+            observed_ms = float(you.get("latency") or 0.0)
+        except (TypeError, ValueError):
+            observed_ms = 0.0
+        if observed_ms > 0:
+            overhead_ms = max(0.0, observed_ms - prev_ms)
+            budget_ms = min(
+                timeout_ms - overhead_ms * _LATENCY_HEADROOM - _LATENCY_SAFETY_MS,
+                _ADAPTIVE_MAX_COMPUTE_MS,
+            )
+    return max(budget_ms, _MIN_COMPUTE_MS)
+
+
+def _record_compute(game_state: Dict, start: float) -> None:
+    """Remember how long this move's compute took, for the next turn's budget."""
+    if len(_prev_compute_ms) > 512:  # stale games; keyed entries never expire
+        _prev_compute_ms.clear()
+    key = (game_state.get("game", {}).get("id", ""), game_state["you"]["id"])
+    _prev_compute_ms[key] = (time.monotonic() - start) * 1000.0
 
 
 class _SearchTimeout(Exception):
@@ -330,6 +369,21 @@ def _apply_moves(sim: Dict, moves: Dict[str, str]) -> Dict:
     }
 
 
+# --- Hunter evaluation weights -----------------------------------------------
+# The search maximizes this score, so aggression lives here: a large bounty for
+# each eliminated opponent, a pull toward smaller heads we can win a
+# head-to-head against, and a bonus for squeezing an opponent's escape room.
+_W_VORONOI = 4.0
+_W_LENGTH_ADV = 30.0
+_W_HEALTH = 0.3
+_W_ENEMY_ALIVE = 400.0  # implicit bounty: each opponent still alive costs this
+_W_HUNT = 3.0  # pull toward the nearest strictly-smaller head
+_W_TRAP = 8.0  # per missing escape cell of a cramped opponent
+_TRAP_WINDOW = 6  # start rewarding once enemy space drops below len + window
+_W_SELF_TRAP = 120.0  # per missing cell of our own escape room
+_HUNT_MIN_HEALTH = 30  # don't chase kills while starving
+
+
 def _evaluate(sim: Dict, my_id: str) -> float:
     snakes = sim["snakes"]
     if my_id not in snakes:
@@ -354,17 +408,49 @@ def _evaluate(sim: Dict, my_id: str) -> float:
     for s in snakes.values():
         occupied.update(s["body"])
 
+    my_len = len(me["body"])
     enemy_heads = [snakes[sid]["body"][0] for sid in others]
     my_dist = _bfs_dist([my_head], occupied, width, height)
     enemy_dist = _bfs_dist(enemy_heads, occupied, width, height)
     voronoi = sum(1 for cell, d in my_dist.items() if d < enemy_dist.get(cell, _BIG))
 
-    length_adv = len(me["body"]) - max(len(snakes[sid]["body"]) for sid in others)
+    length_adv = my_len - max(len(snakes[sid]["body"]) for sid in others)
 
-    score = voronoi * 4.0 + length_adv * 20.0 + me["health"] * 0.5
+    score = (
+        voronoi * _W_VORONOI
+        + length_adv * _W_LENGTH_ADV
+        + me["health"] * _W_HEALTH
+        - len(others) * _W_ENEMY_ALIVE
+    )
+
+    # Own escape room: never hunt ourselves into a pocket.
+    my_space = _flood_fill(my_head, occupied, width, height, limit=my_len + 2)
+    score -= max(0, my_len + 1 - my_space) * _W_SELF_TRAP
+
+    # Hunt: when healthy, close in on the nearest strictly-smaller head
+    # (equal length loses both snakes in a head-to-head, so only chase smaller).
+    if me["health"] >= _HUNT_MIN_HEALTH:
+        smaller_heads = [
+            snakes[sid]["body"][0] for sid in others if len(snakes[sid]["body"]) < my_len
+        ]
+        if smaller_heads:
+            score -= min(_manhattan(my_head, h) for h in smaller_heads) * _W_HUNT
+
+    # Trap: reward states where an opponent is running out of escape room.
+    # Gradient starts while the enemy still has some space so the search can
+    # steer toward a squeeze several moves before it becomes lethal.
+    for sid in others:
+        ebody = snakes[sid]["body"]
+        cap = len(ebody) + _TRAP_WINDOW
+        espace = _flood_fill(ebody[0], occupied, width, height, limit=cap)
+        score += max(0, cap - 1 - espace) * _W_TRAP
+
+    # Food: eat hard until we outsize everyone — length wins head-to-heads —
+    # then keep only a mild pull so hunting dominates.
     if sim["food"]:
         nearest_food = min(_manhattan(my_head, f) for f in sim["food"])
-        score -= nearest_food * (3.0 if me["health"] < HUNGRY_THRESHOLD else 0.1)
+        hungry = me["health"] < HUNGRY_THRESHOLD or length_adv <= 0
+        score -= nearest_food * (3.0 if hungry else 0.1)
     return score
 
 
@@ -441,10 +527,7 @@ def _search(
 def choose_move_search(game_state: Dict) -> Optional[str]:
     """Iterative-deepening paranoid minimax, time-boxed to the move timeout."""
     start = time.monotonic()
-    timeout_ms = game_state.get("game", {}).get("timeout", 500)
-    budget_ms = min(timeout_ms - _MOVE_RESERVE_MS, _MAX_COMPUTE_MS)
-    budget = max(0.02, budget_ms / 1000.0)
-    deadline = start + budget
+    deadline = start + _compute_budget_ms(game_state) / 1000.0
 
     sim = _build_sim(game_state)
     my_id = sim["my_id"]
@@ -455,6 +538,7 @@ def choose_move_search(game_state: Dict) -> Optional[str]:
     if not legal:
         return None
     if len(legal) == 1:
+        _record_compute(game_state, start)
         return legal[0]
 
     best_move: Optional[str] = None
@@ -469,11 +553,11 @@ def choose_move_search(game_state: Dict) -> Optional[str]:
     except _SearchTimeout:
         pass
 
-    # If we couldn't even finish depth 1 in the budget, don't return None (that
-    # would drop us to blind fallbacks): return the cheapest safe legal move,
-    # which is always in-bounds and never reverses into our neck.
+    # Couldn't finish even depth 1 in the budget: returning None would drop us
+    # to the blind fallbacks, so pick the cheapest safe legal move instead.
     if best_move is None:
         best_move = _order_moves(sim, my_id, legal)[0]
+    _record_compute(game_state, start)
     return best_move
 
 
