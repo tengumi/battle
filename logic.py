@@ -37,10 +37,10 @@ def get_info() -> Dict[str, str]:
     return {
         "apiversion": "1",
         "author": "hackathon",
-        "color": "#cc0000",
-        "head": "evil",
-        "tail": "hook",
-        "version": "0.2.0-hunter",
+        "color": "#6434eb",
+        "head": "smart-caterpillar",
+        "tail": "weight",
+        "version": "0.1.0",
     }
 
 
@@ -185,7 +185,14 @@ def _manhattan(a: Point, b: Point) -> int:
 
 _ACTIVE_RADIUS = 5
 _MAX_SEARCH_DEPTH = 12
-_TIME_SAFETY_MARGIN_MS = 120
+# The engine's move timeout (default 500ms) bounds the *entire* HTTP round trip
+# (network + framework + compute), not just our search. On a slow/free host,
+# spending most of the window on compute makes the reply land after the timeout,
+# and the engine then moves us with a default direction that can walk into a
+# wall on turn 0. So we reserve a large slice for everything-but-compute and cap
+# the search budget hard.
+_MOVE_RESERVE_MS = 350
+_MAX_COMPUTE_MS = 150
 
 
 class _SearchTimeout(Exception):
@@ -323,21 +330,6 @@ def _apply_moves(sim: Dict, moves: Dict[str, str]) -> Dict:
     }
 
 
-# --- Hunter evaluation weights -----------------------------------------------
-# The search maximizes this score, so aggression lives here: a large bounty for
-# each eliminated opponent, a pull toward smaller heads we can win a
-# head-to-head against, and a bonus for squeezing an opponent's escape room.
-_W_VORONOI = 4.0
-_W_LENGTH_ADV = 30.0
-_W_HEALTH = 0.3
-_W_ENEMY_ALIVE = 400.0  # implicit bounty: each opponent still alive costs this
-_W_HUNT = 3.0  # pull toward the nearest strictly-smaller head
-_W_TRAP = 8.0  # per missing escape cell of a cramped opponent
-_TRAP_WINDOW = 6  # start rewarding once enemy space drops below len + window
-_W_SELF_TRAP = 120.0  # per missing cell of our own escape room
-_HUNT_MIN_HEALTH = 30  # don't chase kills while starving
-
-
 def _evaluate(sim: Dict, my_id: str) -> float:
     snakes = sim["snakes"]
     if my_id not in snakes:
@@ -362,49 +354,17 @@ def _evaluate(sim: Dict, my_id: str) -> float:
     for s in snakes.values():
         occupied.update(s["body"])
 
-    my_len = len(me["body"])
     enemy_heads = [snakes[sid]["body"][0] for sid in others]
     my_dist = _bfs_dist([my_head], occupied, width, height)
     enemy_dist = _bfs_dist(enemy_heads, occupied, width, height)
     voronoi = sum(1 for cell, d in my_dist.items() if d < enemy_dist.get(cell, _BIG))
 
-    length_adv = my_len - max(len(snakes[sid]["body"]) for sid in others)
+    length_adv = len(me["body"]) - max(len(snakes[sid]["body"]) for sid in others)
 
-    score = (
-        voronoi * _W_VORONOI
-        + length_adv * _W_LENGTH_ADV
-        + me["health"] * _W_HEALTH
-        - len(others) * _W_ENEMY_ALIVE
-    )
-
-    # Own escape room: never hunt ourselves into a pocket.
-    my_space = _flood_fill(my_head, occupied, width, height, limit=my_len + 2)
-    score -= max(0, my_len + 1 - my_space) * _W_SELF_TRAP
-
-    # Hunt: when healthy, close in on the nearest strictly-smaller head
-    # (equal length loses both snakes in a head-to-head, so only chase smaller).
-    if me["health"] >= _HUNT_MIN_HEALTH:
-        smaller_heads = [
-            snakes[sid]["body"][0] for sid in others if len(snakes[sid]["body"]) < my_len
-        ]
-        if smaller_heads:
-            score -= min(_manhattan(my_head, h) for h in smaller_heads) * _W_HUNT
-
-    # Trap: reward states where an opponent is running out of escape room.
-    # Gradient starts while the enemy still has some space so the search can
-    # steer toward a squeeze several moves before it becomes lethal.
-    for sid in others:
-        ebody = snakes[sid]["body"]
-        cap = len(ebody) + _TRAP_WINDOW
-        espace = _flood_fill(ebody[0], occupied, width, height, limit=cap)
-        score += max(0, cap - 1 - espace) * _W_TRAP
-
-    # Food: eat hard until we outsize everyone — length wins head-to-heads —
-    # then keep only a mild pull so hunting dominates.
+    score = voronoi * 4.0 + length_adv * 20.0 + me["health"] * 0.5
     if sim["food"]:
         nearest_food = min(_manhattan(my_head, f) for f in sim["food"])
-        hungry = me["health"] < HUNGRY_THRESHOLD or length_adv <= 0
-        score -= nearest_food * (3.0 if hungry else 0.1)
+        score -= nearest_food * (3.0 if me["health"] < HUNGRY_THRESHOLD else 0.1)
     return score
 
 
@@ -482,7 +442,8 @@ def choose_move_search(game_state: Dict) -> Optional[str]:
     """Iterative-deepening paranoid minimax, time-boxed to the move timeout."""
     start = time.monotonic()
     timeout_ms = game_state.get("game", {}).get("timeout", 500)
-    budget = max(0.05, (timeout_ms - _TIME_SAFETY_MARGIN_MS) / 1000.0)
+    budget_ms = min(timeout_ms - _MOVE_RESERVE_MS, _MAX_COMPUTE_MS)
+    budget = max(0.02, budget_ms / 1000.0)
     deadline = start + budget
 
     sim = _build_sim(game_state)
@@ -508,6 +469,11 @@ def choose_move_search(game_state: Dict) -> Optional[str]:
     except _SearchTimeout:
         pass
 
+    # If we couldn't even finish depth 1 in the budget, don't return None (that
+    # would drop us to blind fallbacks): return the cheapest safe legal move,
+    # which is always in-bounds and never reverses into our neck.
+    if best_move is None:
+        best_move = _order_moves(sim, my_id, legal)[0]
     return best_move
 
 
